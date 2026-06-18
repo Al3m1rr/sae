@@ -16,6 +16,7 @@ TOPICS = [
     "IUT/Colmar2026/SAE2.04/Maison2"
 ]
 
+# Base MySQL sur Windows
 DB_HOST = "10.252.11.79"
 DB_PORT = 3306
 DB_USER = "toto"
@@ -49,25 +50,73 @@ def connexion_db():
         return None
 
 
+def extraire_champ(pattern, payload, nom_champ):
+    """
+    Cherche un champ dans le message MQTT.
+    Si le champ n'existe pas, retourne None au lieu de faire planter le programme.
+    """
+    resultat = re.search(pattern, payload)
+
+    if resultat is None:
+        print(f"[PARSE] Message ignoré, champ manquant : {nom_champ}")
+        print(f"        Message reçu : {payload}")
+        return None
+
+    return resultat.group(1).strip()
+
+
 def parse_message(payload):
     """
     Transforme le message MQTT en données exploitables.
 
-    Message attendu :
-    Id=12A6B8AF6CD3,piece=sejour,date=15/06/2026,heure=12:13:14,temp=26,35
+    Message complet attendu :
+    Id=A72E3F6B79BB,piece=sejour,date=18/06/2026,heure=12:13:14,temp=26,35
+
+    Le script ignore les messages incomplets du style :
+    Id=A72E3F6B79BB
     """
+
     try:
-        id_capteur = re.search(r"Id=([^,]+)", payload).group(1)
-        piece = re.search(r"piece=([^,]+)", payload).group(1)
-        date = re.search(r"date=([^,]+)", payload).group(1)
-        heure = re.search(r"heure=([^,]+)", payload).group(1)
-        temp = re.search(r"temp=([0-9]+(?:[,.][0-9]+)?)", payload).group(1)
+        # ID du capteur
+        id_capteur = extraire_champ(r"(?:Id|ID|id)=([^,]+)", payload, "Id")
+        if id_capteur is None:
+            return None
 
-        # Convertir date JJ/MM/AAAA vers AAAA-MM-JJ pour MySQL
+        # Pièce
+        piece = extraire_champ(r"piece=([^,]+)", payload, "piece")
+        if piece is None:
+            return None
+
+        # Date
+        date = extraire_champ(r"date=([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", payload, "date")
+        if date is None:
+            return None
+
+        # Heure : accepte heure= ou time=
+        heure = None
+
+        resultat_heure = re.search(r"heure=([0-9]{1,2}:[0-9]{2}:[0-9]{2})", payload)
+        resultat_time = re.search(r"time=([0-9]{1,2}:[0-9]{2}:[0-9]{2})", payload)
+
+        if resultat_heure:
+            heure = resultat_heure.group(1).strip()
+        elif resultat_time:
+            heure = resultat_time.group(1).strip()
+        else:
+            print("[PARSE] Message ignoré, champ manquant : heure ou time")
+            print(f"        Message reçu : {payload}")
+            return None
+
+        # Température : accepte 26,35 ou 26.35 ou 26
+        temp = extraire_champ(r"temp=(-?[0-9]+(?:[,.][0-9]+)?)", payload, "temp")
+        if temp is None:
+            return None
+
+        # Conversion date JJ/MM/AAAA vers AAAA-MM-JJ pour MySQL
         jour, mois, annee = date.split("/")
-        date_mesure = f"{annee}-{mois}-{jour} {heure}"
+        date_mesure = f"{annee}-{mois.zfill(2)}-{jour.zfill(2)} {heure}"
 
-        # Convertir 26,35 en 26.35
+        # Conversion température 26,35 vers 26.35
         temperature = float(temp.replace(",", "."))
 
         return {
@@ -78,7 +127,8 @@ def parse_message(payload):
         }
 
     except Exception as e:
-        print(f"[PARSE] Erreur sur le message '{payload}' : {e}")
+        print(f"[PARSE] Erreur sur le message : {payload}")
+        print(f"        Détail erreur : {e}")
         return None
 
 
@@ -90,6 +140,7 @@ def inserer_en_db(conn, data):
 
     cursor = conn.cursor()
 
+    # 1. Insertion du capteur
     # Table : capteur
     # Colonnes : id_capteur, nom, piece, emplacement
     cursor.execute("""
@@ -102,6 +153,7 @@ def inserer_en_db(conn, data):
         data["piece"]
     ))
 
+    # 2. Insertion de la mesure
     # Table : mesure
     # Colonnes : id_capteur, date_mesure, temperature
     cursor.execute("""
@@ -117,7 +169,7 @@ def inserer_en_db(conn, data):
     cursor.close()
 
     print(
-        f"[DB] Inséré — "
+        f"[DB] Inséré : "
         f"{data['id_capteur']} | "
         f"{data['piece']} | "
         f"{data['temperature']}°C | "
@@ -127,7 +179,7 @@ def inserer_en_db(conn, data):
 
 def vider_cache(conn):
     """
-    Après une reconnexion DB, réinsère tous les messages stockés dans le cache.
+    Si la base était coupée, on réinsère les messages gardés en cache.
     """
     global cache
 
@@ -153,8 +205,8 @@ def vider_cache(conn):
 
 def traiter_message(data):
     """
-    Essaie d'insérer en DB.
-    Si la DB est indisponible, met le message en cache.
+    Essaie d'insérer en base.
+    Si la BDD est inaccessible, on met le message en cache.
     """
     global cache
 
@@ -167,7 +219,9 @@ def traiter_message(data):
             conn.close()
 
         except Error as e:
-            print(f"[DB] Erreur insertion : {e} → mise en cache")
+            print(f"[DB] Erreur insertion : {e}")
+            print("[CACHE] Message mis en cache")
+
             cache.append(data)
 
             if conn.is_connected():
@@ -175,14 +229,14 @@ def traiter_message(data):
 
     else:
         cache.append(data)
-        print(f"[CACHE] DB indisponible → message mis en cache. Total : {len(cache)}")
+        print(f"[CACHE] BDD indisponible, message mis en cache. Total : {len(cache)}")
 
 
 # ============ CALLBACKS MQTT ============
 
 def on_connect(client, userdata, flags, rc):
     """
-    Appelé quand le client se connecte au broker MQTT.
+    Fonction appelée quand le client se connecte au broker MQTT.
     """
     if rc == 0:
         print(f"[MQTT] Connecté au broker {BROKER}")
@@ -192,12 +246,12 @@ def on_connect(client, userdata, flags, rc):
             print(f"[MQTT] Abonné au topic : {topic}")
 
     else:
-        print(f"[MQTT] Erreur de connexion au broker MQTT. Code : {rc}")
+        print(f"[MQTT] Erreur de connexion au broker. Code : {rc}")
 
 
 def on_message(client, userdata, msg):
     """
-    Appelé à chaque message MQTT reçu.
+    Fonction appelée à chaque message MQTT reçu.
     """
     payload = msg.payload.decode("utf-8").strip()
 
@@ -208,12 +262,22 @@ def on_message(client, userdata, msg):
     data = parse_message(payload)
 
     if data:
+        print(
+            f"[PARSE] OK : "
+            f"{data['id_capteur']} | "
+            f"{data['piece']} | "
+            f"{data['date_mesure']} | "
+            f"{data['temperature']}°C"
+        )
+
         traiter_message(data)
+    else:
+        print("[INFO] Message non inséré car incomplet ou incorrect.")
 
 
 def on_disconnect(client, userdata, rc):
     """
-    Appelé quand le client se déconnecte du broker.
+    Fonction appelée quand le client se déconnecte du broker MQTT.
     """
     print(f"[MQTT] Déconnecté du broker. Code : {rc}")
 
