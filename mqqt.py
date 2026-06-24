@@ -17,10 +17,10 @@ TOPICS = [
 ]
 
 # Base MySQL sur Windows
-DB_HOST = "10.252.11.79"
+DB_HOST = "10.252.5.75"
 DB_PORT = 3306
-DB_USER = "toto"
-DB_PASSWORD = "toto"
+DB_USER = "saeuser"
+DB_PASSWORD = "sae204"
 DB_NAME = "sae204"
 
 # =======================================
